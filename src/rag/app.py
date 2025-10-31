@@ -70,6 +70,7 @@ Regras:
 - Nunca invente tabelas ou colunas.
 - Sempre responda com SQL válido para PostgreSQL.
 - Não retornar mais de uma query
+- quando existir alguma query que utilize a tabela CUSTOMERS, a propriedade name é customer_name
 """
 
 # =========================

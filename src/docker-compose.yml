@@ -1,0 +1,125 @@
+version: "3.9"
+
+networks:
+  internal_net:
+    driver: bridge
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis_cache
+    restart: unless-stopped
+    networks:
+      - internal_net
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server --appendonly yes
+                   --maxmemory 512mb
+                   --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "localhost", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  rag_api:
+    build:
+      context: ./rag
+      dockerfile: Dockerfile
+    container_name: rag_query_builder_api
+    restart: unless-stopped
+    networks:
+      - internal_net
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # OpenAI Configuration
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4-turbo-preview}"
+      OPENAI_EMBED_MODEL: "${OPENAI_EMBED_MODEL:-text-embedding-3-small}"
+
+      # Application Configuration
+      CORPUS_DIR: "/app/corpus"
+      TOP_K: "6"
+      CHUNK_SIZE: "2000"
+      TIMEOUT_SECONDS: "180"
+
+      # ChromaDB Configuration
+      CHROMA_PERSIST_DIR: "/app/chroma"
+      CHROMA_COLLECTION: "querybuilder_docs"
+
+      # Cache Configuration
+      CACHE_ENABLED: "true"
+      CACHE_TYPE: "redis"
+      REDIS_URL: "redis://redis:6379/0"
+
+      # Database connection (disponibiliza para API)
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+    volumes:
+      - ./rag/corpus:/app/corpus:rw
+      - chroma_data:/app/chroma
+      # o app.py sobrescreve o container — útil p/ dev; para prod, remova:
+      - ./rag/app.py:/app/app.py:ro
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: postgres:15
+    container_name: godlevel-db
+    restart: unless-stopped
+    networks:
+      - internal_net
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./data-generator/database-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  data-generator:
+    build:
+      context: ./data-generator
+      dockerfile: Dockerfile
+    container_name: godlevel-data-gen
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal_net
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+    command: >
+      sh -c "
+        echo '⏳ Waiting for database to be ready...' &&
+        sleep 5 &&
+        echo '🚀 Generating sample data...' &&
+        python generate_data.py --db-url postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      "
+    profiles:
+      - tools
+
+volumes:
+  chroma_data:
+  redis_data:
+  postgres_data:
+    driver: local
