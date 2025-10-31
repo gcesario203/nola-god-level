@@ -19,8 +19,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable is required")
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4-turbo-preview")
-OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large")
 
 CORPUS_DIR = Path(os.getenv("CORPUS_DIR", "./corpus"))
 TOP_K = int(os.getenv("TOP_K", "6"))
@@ -29,7 +29,15 @@ TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "180"))
 
 # Persistência do Chroma (opcional)
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "").strip()
-CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "querybuilder_docs")
+
+# Base do nome da coleção (permite manter compatibilidade com env atual)
+CHROMA_COLLECTION_BASE = os.getenv("CHROMA_COLLECTION", "querybuilder_docs")
+
+# Dica de dimensão a partir do modelo (não é obrigatório pelo Chroma, mas útil para logs)
+EMBED_DIM_HINT = 3072 if "large" in OPENAI_EMBED_MODEL else 1536
+
+# Nome da coleção passa a incluir o nome do modelo de embedding para evitar conflito de dimensões
+CHROMA_COLLECTION = f"{CHROMA_COLLECTION_BASE}__{OPENAI_EMBED_MODEL}"
 
 # Configurações de Cache
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
@@ -58,6 +66,10 @@ Regras:
 - Para granularidade diária: DATE(sales.created_at) como sale_date.
 - Joins frequentes: sales→stores, sales→channels, sales→customers (LEFT), product_sales→sales, item_product_sales→product_sales, payments→payment_types.
 - Se faltar algo no contexto, explique em "assumptions".
+- DDL não é permitido.
+- Nunca invente tabelas ou colunas.
+- Sempre responda com SQL válido para PostgreSQL.
+- Não retornar mais de uma query
 """
 
 # =========================
@@ -192,6 +204,7 @@ def log_env():
     print("[ENV] OPENAI_API_KEY:", "***" if OPENAI_API_KEY else "NOT SET")
     print("[ENV] OPENAI_MODEL:", OPENAI_MODEL)
     print("[ENV] OPENAI_EMBED_MODEL:", OPENAI_EMBED_MODEL)
+    print("[ENV] EMBED_DIM_HINT:", EMBED_DIM_HINT)
     print("[ENV] CORPUS_DIR:", str(CORPUS_DIR))
     print("[ENV] TOP_K:", TOP_K)
     print("[ENV] CHUNK_SIZE:", CHUNK_SIZE)
@@ -204,6 +217,7 @@ def log_env():
         print("[ENV] CHROMA_PERSIST_DIR:", CHROMA_PERSIST_DIR)
     else:
         print("[ENV] CHROMA_PERSIST_DIR: (in-memory)")
+    print("[ENV] CHROMA_COLLECTION_BASE:", CHROMA_COLLECTION_BASE)
     print("[ENV] CHROMA_COLLECTION:", CHROMA_COLLECTION)
 
 
@@ -240,8 +254,24 @@ def ensure_collection():
     client_db = get_chroma_client()
     try:
         col = client_db.get_collection(CHROMA_COLLECTION)
-    except:
+    except Exception:
         col = client_db.create_collection(CHROMA_COLLECTION)
+
+    # Validação de compatibilidade de dimensão via embedding de teste
+    try:
+        dummy_emb = embed("dimension_check_probe")
+        # A consulta abaixo força o Chroma a validar a dimensão da coleção
+        _ = col.query(query_embeddings=[dummy_emb], n_results=1)
+    except Exception as e:
+        msg = (
+            f"Incompatibilidade de dimensão de embeddings para a coleção '{CHROMA_COLLECTION}'. "
+            f"O modelo atual '{OPENAI_EMBED_MODEL}' sugere dimensão {EMBED_DIM_HINT}. "
+            f"Sugestões: (a) use um nome de coleção diferente; (b) resete a coleção atual e reingeste."
+        )
+        print("[CHROMA DIMENSION ERROR]", msg, "Detalhes:", str(e))
+        # Falhar cedo para forçar ação corretiva
+        raise
+
     return client_db, col
 
 
@@ -349,7 +379,9 @@ def health():
         "model": OPENAI_MODEL,
         "embed_model": OPENAI_EMBED_MODEL,
         "cache_enabled": CACHE_ENABLED,
-        "cache_type": CACHE_TYPE
+        "cache_type": CACHE_TYPE,
+        "chroma_collection": CHROMA_COLLECTION,
+        "embed_dim_hint": EMBED_DIM_HINT
     }
 
 
@@ -369,6 +401,22 @@ def clear_cache():
     try:
         cache_manager.clear()
         return {"message": "Cache cleared successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chroma/reset")
+def chroma_reset():
+    """Reseta a coleção atual e cria uma nova vazia. É necessário reingestar em seguida."""
+    try:
+        client_db = get_chroma_client()
+        try:
+            client_db.delete_collection(CHROMA_COLLECTION)
+        except Exception:
+            # Se não existir, ignoramos
+            pass
+        client_db.create_collection(CHROMA_COLLECTION)
+        return {"message": f"Collection '{CHROMA_COLLECTION}' reset. Execute /ingest para reindexar."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
