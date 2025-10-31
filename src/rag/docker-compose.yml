@@ -5,6 +5,24 @@ networks:
     driver: bridge
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis_cache
+    restart: unless-stopped
+    networks:
+      - internal_net
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   rag_api:
     build:
       context: .
@@ -13,6 +31,9 @@ services:
     restart: unless-stopped
     networks:
       - internal_net
+    depends_on:
+      redis:
+        condition: service_healthy
     environment:
       # OpenAI Configuration
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
@@ -28,6 +49,11 @@ services:
       # ChromaDB Configuration
       CHROMA_PERSIST_DIR: "/app/chroma"
       CHROMA_COLLECTION: "querybuilder_docs"
+      
+      # Cache Configuration
+      CACHE_ENABLED: "true"
+      CACHE_TYPE: "redis"
+      REDIS_URL: "redis://redis:6379/0"
     volumes:
       - ./corpus:/app/corpus:rw
       - chroma_data:/app/chroma
@@ -43,3 +69,4 @@ services:
 
 volumes:
   chroma_data:
+  redis_data:
