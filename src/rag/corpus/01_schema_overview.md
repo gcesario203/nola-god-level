@@ -82,30 +82,30 @@ Diretriz: evite multiplicação de linhas ao juntar `sales` com `product_sales` 
 ## Padrões de Filtro e Tempo
 - Janela padrão (fallback): últimos 90 dias
   - Prefira predicados por range para aproveitar índices:
-    `s.created_at >= NOW() - INTERVAL '90 days'`
-- Status padrão: `s.sale_status_desc = 'COMPLETED'`
+    `sls.created_at >= NOW() - INTERVAL '90 days'`
+- Status padrão: `sls.sale_status_desc = 'COMPLETED'`
 - Derivações temporais (para SELECT/GROUP BY):
-  - Dia: `DATE_TRUNC('day', s.created_at)` → `sale_date`
-  - Semana ISO: `DATE_TRUNC('week', s.created_at)` → `sale_week`
-  - Mês: `DATE_TRUNC('month', s.created_at)` → `sale_month`
-  - Dia da semana: `EXTRACT(DOW FROM s.created_at)` (0=domingo) → `dow`
-  - Hora: `EXTRACT(HOUR FROM s.created_at)` → `hour`
+  - Dia: `DATE_TRUNC('day', sls.created_at)` → `sale_date`
+  - Semana ISO: `DATE_TRUNC('week', sls.created_at)` → `sale_week`
+  - Mês: `DATE_TRUNC('month', sls.created_at)` → `sale_month`
+  - Dia da semana: `EXTRACT(DOW FROM sls.created_at)` (0=domingo) → `dow`
+  - Hora: `EXTRACT(HOUR FROM sls.created_at)` → `hour`
 
 ## Métricas Canônicas (Definições Base)
-- Faturamento por venda: `SUM(s.total_amount)`
-- Pedidos (contagem de vendas): `COUNT(DISTINCT s.id)`
-- Ticket médio: `SUM(s.total_amount)/NULLIF(COUNT(DISTINCT s.id),0)`
-- Receita por produto: `SUM(ps.total_price)`
-- Unidades por produto: `SUM(ps.quantity)`
+- Faturamento por venda: `SUM(sls.total_amount)`
+- Pedidos (contagem de vendas): `COUNT(DISTINCT sls.id)`
+- Ticket médio: `SUM(sls.total_amount)/NULLIF(COUNT(DISTINCT sls.id),0)`
+- Receita por produto: `SUM(prs.total_price)`
+- Unidades por produto: `SUM(prs.quantity)`
 - SLA de entrega (percentis):
-  `PERCENTILE_CONT(0.5/0.9) WITHIN GROUP (ORDER BY s.delivery_seconds)`
+  `PERCENTILE_CONT(0.5/0.9) WITHIN GROUP (ORDER BY sls.delivery_seconds)`
 
 Observação: diferencie claramente “receita por venda” (`sales.total_amount`) de “receita por produto” (`product_sales.total_price`) nas análises e rótulos.
 
 ## Diretrizes de Performance
 - Índices-chave existentes:
   - `idx_sales_date_status ON sales(created_at, sale_status_desc)`
-    - Observação: use ranges em `created_at` no WHERE (evite `DATE(s.created_at)` no predicado) para o plano usar o índice.
+    - Observação: use ranges em `created_at` no WHERE (evite `DATE(sls.created_at)` no predicado) para o plano usar o índice.
   - `idx_product_sales_product_sale ON product_sales(product_id, sale_id)`
 - Índices recomendados (avaliar conforme carga/consultas):
   - `sales(channel_id, created_at, sale_status_desc)`
@@ -124,23 +124,41 @@ Use este snippet como base para queries analíticas:
 ```sql
 WITH base AS (
   SELECT
-    s.id,
-    s.store_id,
-    s.channel_id,
-    s.customer_id,
-    s.created_at,
-    s.sale_status_desc,
-    s.total_amount,
-    s.value_paid,
-    s.total_discount,
-    s.delivery_seconds
-  FROM sales s
-  WHERE s.sale_status_desc = 'COMPLETED'
-    AND s.created_at >= NOW() - INTERVAL '90 days'
+    sls.id,
+    sls.store_id,
+    sls.channel_id,
+    sls.customer_id,
+    sls.created_at,
+    sls.sale_status_desc,
+    sls.total_amount,
+    sls.value_paid,
+    sls.total_discount,
+    sls.delivery_seconds
+  FROM sales sls
+  WHERE sls.sale_status_desc = 'COMPLETED'
+    AND sls.created_at >= NOW() - INTERVAL '90 days'
 )
 ```
 
+## Aliases e Prefixos (mínimo 3 letras)
+- Use aliases com no mínimo 3 letras, claros e estáveis.
+- Nunca use palavras reservadas como alias (ex.: `is`, `on`, `in`, `to`).
+- Prefixos recomendados:
+  - `sls` → `sales`
+  - `prs` → `product_sales`
+  - `ips` → `item_product_sales`
+  - `str` → `stores`
+  - `chn` → `channels`
+  - `cst` → `customers`
+  - `pmt` → `payments`
+  - `ptp` → `payment_types`
+  - `prd` → `products`
+  - `itm` → `items`
+  - `cat` → `categories`
+  - `brd` → `brands`
+  - `sbd` → `sub_brands`
+
 ## Sanity Checks (Recomendações)
-- `SUM(payments.value)` por `sale_id` deve se aproximar de `sales.value_paid` (diferenças podem ocorrer por troco/descontos).
-- `products.category_id` deve apontar para `categories.type='P'`; `items.category_id` para `type='I'`.
-- Nem toda venda `channels.type='D'` terá `delivery_sales/delivery_addresses` em dados incompletos; use `LEFT JOIN`.
+- `SUM(pmt.value)` por `sale_id` deve se aproximar de `sls.value_paid` (diferenças podem ocorrer por troco/descontos).
+- `prd.category_id` deve apontar para `categories.type='P'`; `itm.category_id` para `type='I'`.
+- Nem toda venda `chn.type='D'` terá `delivery_sales/delivery_addresses` em dados incompletos; use `LEFT JOIN`.

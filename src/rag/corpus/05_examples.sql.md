@@ -1,182 +1,160 @@
 
 # Exemplos de Queries
 
-Este documento reúne padrões de consultas prontas, seguindo as diretrizes de filtros, joins e métricas definidas nos arquivos anteriores. Todas as queries:
+Todas as queries:
 - Filtram `sale_status_desc = 'COMPLETED'`.
-- Usam janelas temporais com predicados por range para aproveitar índices.
-- Evitam multiplicação de linhas ao lidar com fatos granulares.
+- Usam predicados por range no tempo para aproveitar índices.
+- Evitam multiplicação de linhas agregando fatos granulares antes dos joins.
+- Usam aliases com no mínimo 3 letras.
 
 ## 1) Vendas por canal por dia (8 semanas) com ticket médio
 Objetivo: volume de vendas, faturamento e ticket médio por canal e dia nos últimos 56 dias.
 
 ```sql
 WITH base AS (
-  SELECT s.id, s.created_at, s.total_amount, s.sale_status_desc, s.channel_id
-  FROM sales s
-  WHERE s.created_at >= NOW() - INTERVAL '56 days'
-    AND s.sale_status_desc = 'COMPLETED'
+  SELECT sls.id, sls.created_at, sls.total_amount, sls.sale_status_desc, sls.channel_id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '56 days'
+    AND sls.sale_status_desc = 'COMPLETED'
 )
 SELECT
-  DATE_TRUNC('day', b.created_at) AS sale_date,
-  c.name AS channel_name,
-  COUNT(DISTINCT b.id) AS sales_count,
-  SUM(b.total_amount) AS total_amount,
-  ROUND(SUM(b.total_amount) / NULLIF(COUNT(DISTINCT b.id),0), 2) AS avg_ticket
-FROM base b
-JOIN channels c ON c.id = b.channel_id
-GROUP BY 1,2
-ORDER BY 1,2;
+  DATE_TRUNC('day', bse.created_at) AS sale_date,
+  chn.name AS channel_name,
+  COUNT(DISTINCT bse.id) AS sales_count,
+  SUM(bse.total_amount) AS total_amount,
+  ROUND(SUM(bse.total_amount) / NULLIF(COUNT(DISTINCT bse.id), 0), 2) AS avg_ticket
+FROM base bse
+JOIN channels chn ON chn.id = bse.channel_id
+GROUP BY 1, 2
+ORDER BY 1, 2;
 ```
 
-Notas:
-- `DATE_TRUNC('day', ...)` é preferível a `DATE(...)` para consistência com outros grãos temporais.
-- Se desejar apenas delivery/presencial, adicione `WHERE c.type IN ('D')` ou `('P')`.
-
 ## 2) Top 10 produtos por receita (90 dias)
-Objetivo: ranquear produtos por receita total (somatório de `product_sales.total_price`).
-
 ```sql
 WITH base AS (
-  SELECT s.id
-  FROM sales s
-  WHERE s.created_at >= NOW() - INTERVAL '90 days'
-    AND s.sale_status_desc = 'COMPLETED'
+  SELECT sls.id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '90 days'
+    AND sls.sale_status_desc = 'COMPLETED'
 ),
 prod AS (
-  SELECT ps.product_id, SUM(ps.total_price) AS revenue
-  FROM product_sales ps
-  JOIN base b ON b.id = ps.sale_id
-  GROUP BY ps.product_id
+  SELECT prs.product_id, SUM(prs.total_price) AS revenue
+  FROM product_sales prs
+  JOIN base bse ON bse.id = prs.sale_id
+  GROUP BY prs.product_id
 )
-SELECT p.name, pr.revenue
+SELECT prd.name, pr.revenue
 FROM prod pr
-JOIN products p ON p.id = pr.product_id
+JOIN products prd ON prd.id = pr.product_id
 ORDER BY pr.revenue DESC
 LIMIT 10;
 ```
 
-Notas:
-- A agregação é feita em `product_sales` antes de juntar a `products` para evitar duplicidades.
-- Para filtrar por sub_brand, inclua join com `products.sub_brand_id` ou `brands`.
-
 ## 3) Faturamento por loja e cidade (30 dias)
-Objetivo: faturamento e contagem de pedidos por loja e cidade.
-
 ```sql
 WITH base AS (
-  SELECT s.id, s.store_id, s.total_amount, s.delivery_fee, s.service_tax_fee, s.created_at
-  FROM sales s
-  WHERE s.created_at >= NOW() - INTERVAL '30 days'
-    AND s.sale_status_desc = 'COMPLETED'
+  SELECT sls.id, sls.store_id, sls.total_amount, sls.delivery_fee, sls.service_tax_fee, sls.created_at
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '30 days'
+    AND sls.sale_status_desc = 'COMPLETED'
 )
 SELECT
-  st.name AS store_name,
-  st.city,
-  COUNT(DISTINCT b.id) AS sales_count,
-  SUM(b.total_amount) AS total_amount,
-  SUM(b.delivery_fee) AS total_delivery_fee,
-  SUM(b.service_tax_fee) AS total_service_tax
-FROM base b
-JOIN stores st ON st.id = b.store_id
-GROUP BY 1,2
+  str.name AS store_name,
+  str.city,
+  COUNT(DISTINCT bse.id) AS sales_count,
+  SUM(bse.total_amount) AS total_amount,
+  SUM(bse.delivery_fee) AS total_delivery_fee,
+  SUM(bse.service_tax_fee) AS total_service_tax
+FROM base bse
+JOIN stores str ON str.id = bse.store_id
+GROUP BY 1, 2
 ORDER BY total_amount DESC;
 ```
 
-Notas:
-- Se preferir consolidar por UF, substitua `st.city` por `st.state`.
-- Para excluir lojas inativas: adicione `WHERE st.is_active IS TRUE`.
-
-## 4) Mix de pagamentos por tipo (últimos 60 dias)
-Objetivo: composição do valor pago por tipo de pagamento.
-
+## 4) Mix de pagamentos por tipo (60 dias) com participação
 ```sql
 WITH base AS (
-  SELECT s.id
-  FROM sales s
-  WHERE s.created_at >= NOW() - INTERVAL '60 days'
-    AND s.sale_status_desc = 'COMPLETED'
+  SELECT sls.id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '60 days'
+    AND sls.sale_status_desc = 'COMPLETED'
+),
+pay_mix AS (
+  SELECT
+    ptp.description AS payment_type,
+    SUM(pmt.value)  AS paid_value
+  FROM base bse
+  LEFT JOIN payments pmt      ON pmt.sale_id = bse.id
+  LEFT JOIN payment_types ptp ON ptp.id = pmt.payment_type_id
+  GROUP BY 1
 )
 SELECT
-  pt.description AS payment_type,
-  SUM(p.value)   AS paid_value
-FROM base b
-LEFT JOIN payments p      ON p.sale_id = b.id
-LEFT JOIN payment_types pt ON pt.id = p.payment_type_id
-GROUP BY 1
+  payment_type,
+  paid_value,
+  ROUND(100.0 * paid_value / NULLIF(SUM(paid_value) OVER (), 0), 2) AS pct_share
+FROM pay_mix
 ORDER BY paid_value DESC;
 ```
 
-Notas:
-- `LEFT JOIN` preserva vendas mesmo se houver divergência/ausência de lançamento em `payments`.
-- Para participação percentual por tipo, divida por o total geral com uma window function.
-
-## 5) SLA de entrega (P50/P90) por canal (90 dias, somente Delivery)
-Objetivo: percentis de tempo de entrega por canal de delivery.
-
+## 5) SLA de entrega (P50/P90) por canal (Delivery, 90 dias)
 ```sql
 WITH base AS (
-  SELECT s.id, s.channel_id, s.delivery_seconds
-  FROM sales s
-  WHERE s.created_at >= NOW() - INTERVAL '90 days'
-    AND s.sale_status_desc = 'COMPLETED'
+  SELECT sls.id, sls.channel_id, sls.delivery_seconds
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '90 days'
+    AND sls.sale_status_desc = 'COMPLETED'
 )
 SELECT
-  c.name AS channel_name,
-  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY b.delivery_seconds) AS p50_delivery_s,
-  PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY b.delivery_seconds) AS p90_delivery_s
-FROM base b
-JOIN channels c ON c.id = b.channel_id
-WHERE c.type = 'D'
+  chn.name AS channel_name,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bse.delivery_seconds) AS p50_delivery_s,
+  PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY bse.delivery_seconds) AS p90_delivery_s
+FROM base bse
+JOIN channels chn ON chn.id = bse.channel_id
+WHERE chn.type = 'D'
 GROUP BY 1
 ORDER BY p50_delivery_s;
 ```
 
-Notas:
-- Garanta que `delivery_seconds` não contenha nulos ou outliers extremos conforme regra do negócio.
-
 ## 6) Top 10 itens/complementos por receita (90 dias)
-Objetivo: ranquear itens de `item_product_sales` por receita, considerando grupos de opção.
-
 ```sql
 WITH base AS (
-  SELECT s.id
-  FROM sales s
-  WHERE s.created_at >= NOW() - INTERVAL '90 days'
-    AND s.sale_status_desc = 'COMPLETED'
+  SELECT sls.id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '90 days'
+    AND sls.sale_status_desc = 'COMPLETED'
 ),
 items_agg AS (
   SELECT
     ips.item_id,
-    COALESCE(og.name, 'Sem grupo') AS option_group_name,
+    COALESCE(ogr.name, 'Sem grupo') AS option_group_name,
     SUM(ips.quantity) AS units,
     SUM(ips.amount)   AS amount
   FROM item_product_sales ips
-  JOIN product_sales ps ON ps.id = ips.product_sale_id
-  JOIN base b          ON b.id = ps.sale_id
-  LEFT JOIN option_groups og ON og.id = ips.option_group_id
-  GROUP BY 1,2
+  JOIN product_sales prs ON prs.id = ips.product_sale_id
+  JOIN base bse          ON bse.id = prs.sale_id
+  LEFT JOIN option_groups ogr ON ogr.id = ips.option_group_id
+  GROUP BY 1, 2
 )
-SELECT i.name AS item_name, option_group_name, units, amount
-FROM items_agg ia
-JOIN items i ON i.id = ia.item_id
+SELECT itm.name AS item_name, option_group_name, units, amount
+FROM items_agg iag
+JOIN items itm ON itm.id = iag.item_id
 ORDER BY amount DESC
 LIMIT 10;
 ```
 
-Notas:
-- A agregação em `item_product_sales` evita multiplicar linhas quando cruzada com outras dimensões.
-- Útil para entender upsell de complementos.
-
 ## 7) Recorrência de clientes (120 dias)
-Objetivo: classificar clientes por frequência de compras.
-
 ```sql
 WITH base AS (
-  SELECT s.id, s.customer_id
-  FROM sales s
-  WHERE s.created_at >= NOW() - INTERVAL '120 days'
-    AND s.sale_status_desc = 'COMPLETED'
-    AND s.customer_id IS NOT NULL
+  SELECT sls.id, sls.customer_id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '120 days'
+    AND sls.sale_status_desc = 'COMPLETED'
+    AND sls.customer_id IS NOT NULL
+),
+counts AS (
+  SELECT customer_id, COUNT(*) AS cnt
+  FROM base
+  GROUP BY customer_id
 )
 SELECT
   CASE
@@ -185,64 +163,285 @@ SELECT
     ELSE 'Alta recorrência (5+)'
   END AS cohort,
   COUNT(*) AS customers
-FROM (
-  SELECT customer_id, COUNT(*) AS cnt
-  FROM base
-  GROUP BY customer_id
-) t
+FROM counts
 GROUP BY 1
 ORDER BY 1;
 ```
 
-Notas:
-- `LEFT JOIN customers` pode ser adicionado para atributos (e-mail, origem etc.), mantendo privacidade.
-
 ## 8) Curva ABC de produtos (90 dias)
-Objetivo: classificar produtos em A/B/C com base na participação na receita.
-
 ```sql
 WITH base AS (
-  SELECT s.id
-  FROM sales s
-  WHERE s.created_at >= NOW() - INTERVAL '90 days'
-    AND s.sale_status_desc = 'COMPLETED'
+  SELECT sls.id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '90 days'
+    AND sls.sale_status_desc = 'COMPLETED'
 ),
 prod AS (
-  SELECT ps.product_id, SUM(ps.total_price) AS revenue
-  FROM product_sales ps
-  JOIN base b ON b.id = ps.sale_id
-  GROUP BY ps.product_id
+  SELECT prs.product_id, SUM(prs.total_price) AS revenue
+  FROM product_sales prs
+  JOIN base bse ON bse.id = prs.sale_id
+  GROUP BY prs.product_id
 ),
 ranked AS (
   SELECT
-    p.product_id,
-    p.revenue,
-    RANK() OVER (ORDER BY p.revenue DESC) AS rnk,
-    SUM(p.revenue) OVER () AS total_rev,
-    SUM(p.revenue) OVER (ORDER BY p.revenue DESC) AS cum_rev
-  FROM prod p
+    prd.product_id,
+    prd.revenue,
+    RANK() OVER (ORDER BY prd.revenue DESC) AS rnk,
+    SUM(prd.revenue) OVER () AS total_rev,
+    SUM(prd.revenue) OVER (ORDER BY prd.revenue DESC) AS cum_rev
+  FROM prod prd
 ),
 scored AS (
   SELECT
     product_id,
     revenue,
-    cum_rev / NULLIF(total_rev,0) AS cum_share
+    cum_rev / NULLIF(total_rev, 0) AS cum_share
   FROM ranked
 )
 SELECT
   prd.name,
-  s.revenue,
+  sco.revenue,
   CASE
-    WHEN s.cum_share <= 0.8 THEN 'A'
-    WHEN s.cum_share <= 0.95 THEN 'B'
+    WHEN sco.cum_share <= 0.8  THEN 'A'
+    WHEN sco.cum_share <= 0.95 THEN 'B'
     ELSE 'C'
   END AS abc_class
-FROM scored s
-JOIN products prd ON prd.id = s.product_id
-ORDER BY s.revenue DESC;
+FROM scored sco
+JOIN products prd ON prd.id = sco.product_id
+ORDER BY sco.revenue DESC;
 ```
 
-Notas:
-- Limiares A/B/C podem ser ajustados conforme política (ex.: 70/90).
+## 9) Top-N por grupo: 3 produtos mais vendidos por loja (30 dias)
+```sql
+WITH base AS (
+  SELECT sls.id, sls.store_id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '30 days'
+    AND sls.sale_status_desc = 'COMPLETED'
+),
+prod_store AS (
+  SELECT
+    prs.product_id,
+    bse.store_id,
+    SUM(prs.total_price) AS revenue
+  FROM product_sales prs
+  JOIN base bse ON bse.id = prs.sale_id
+  GROUP BY 1, 2
+),
+ranked AS (
+  SELECT
+    prs.product_id,
+    prs.store_id,
+    prs.revenue,
+    ROW_NUMBER() OVER (PARTITION BY prs.store_id ORDER BY prs.revenue DESC) AS rn
+  FROM prod_store prs
+)
+SELECT
+  str.name AS store_name,
+  prd.name AS product_name,
+  rnk.revenue
+FROM ranked rnk
+JOIN stores str   ON str.id = rnk.store_id
+JOIN products prd ON prd.id = rnk.product_id
+WHERE rnk.rn <= 3
+ORDER BY str.name, rnk.revenue DESC;
+```
 
----
+## 10) Rolling 7d: vendas por dia com média móvel
+```sql
+WITH base AS (
+  SELECT sls.id, sls.created_at, sls.total_amount
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '120 days'
+    AND sls.sale_status_desc = 'COMPLETED'
+),
+daily AS (
+  SELECT
+    DATE_TRUNC('day', bse.created_at) AS sale_date,
+    SUM(bse.total_amount) AS daily_amount
+  FROM base bse
+  GROUP BY 1
+)
+SELECT
+  dly.sale_date,
+  dly.daily_amount,
+  AVG(dly.daily_amount) OVER (
+    ORDER BY dly.sale_date
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS ma7_amount
+FROM daily dly
+ORDER BY dly.sale_date;
+```
+
+## 11) Último preço efetivo por produto (Postgres DISTINCT ON)
+```sql
+WITH base AS (
+  SELECT
+    prs.product_id,
+    sls.created_at,
+    prs.total_price / NULLIF(prs.quantity, 0) AS unit_price
+  FROM product_sales prs
+  JOIN sales sls ON sls.id = prs.sale_id
+  WHERE sls.sale_status_desc = 'COMPLETED'
+    AND sls.created_at >= NOW() - INTERVAL '180 days'
+)
+SELECT DISTINCT ON (bse.product_id)
+  bse.product_id,
+  prd.name AS product_name,
+  bse.unit_price,
+  bse.created_at AS last_sold_at
+FROM base bse
+JOIN products prd ON prd.id = bse.product_id
+ORDER BY bse.product_id, bse.created_at DESC;
+```
+
+## 12) Cohort mensal de retenção (primeira compra vs. retornos)
+```sql
+WITH base AS (
+  SELECT sls.id, sls.customer_id, sls.created_at
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '365 days'
+    AND sls.sale_status_desc = 'COMPLETED'
+    AND sls.customer_id IS NOT NULL
+),
+first_purchase AS (
+  SELECT
+    bse.customer_id,
+    DATE_TRUNC('month', MIN(bse.created_at)) AS cohort_month
+  FROM base bse
+  GROUP BY bse.customer_id
+),
+activity AS (
+  SELECT
+    bse.customer_id,
+    DATE_TRUNC('month', bse.created_at) AS activity_month
+  FROM base bse
+)
+SELECT
+  fp.cohort_month,
+  act.activity_month,
+  COUNT(DISTINCT act.customer_id) AS active_customers
+FROM first_purchase fp
+JOIN activity act ON act.customer_id = fp.customer_id
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
+
+## 13) Normalização de canais (de-para textual)
+```sql
+WITH base AS (
+  SELECT sls.id, sls.channel_id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '90 days'
+    AND sls.sale_status_desc = 'COMPLETED'
+),
+nm AS (
+  SELECT
+    chn.id,
+    CASE
+      WHEN LOWER(chn.name) IN ('ifood', 'i-food', 'i food') THEN 'iFood'
+      WHEN LOWER(chn.name) IN ('app', 'application', 'mobile app') THEN 'App'
+      ELSE chn.name
+    END AS channel_norm
+  FROM channels chn
+)
+SELECT
+  nm.channel_norm,
+  COUNT(DISTINCT bse.id) AS sales_count
+FROM base bse
+JOIN nm ON nm.id = bse.channel_id
+GROUP BY 1
+ORDER BY 2 DESC;
+```
+
+## 14) Basket analysis simples: co-ocorrência de produtos
+Objetivo: pares de produtos que mais ocorrem juntos no mesmo pedido.
+
+```sql
+WITH base AS (
+  SELECT sls.id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '120 days'
+    AND sls.sale_status_desc = 'COMPLETED'
+),
+pairs AS (
+  SELECT
+    LEAST(a.product_id, b.product_id)  AS product_id_a,
+    GREATEST(a.product_id, b.product_id) AS product_id_b,
+    COUNT(*) AS cnt_orders_together
+  FROM product_sales a
+  JOIN product_sales b
+    ON a.sale_id = b.sale_id
+   AND a.product_id < b.product_id
+  JOIN base bse ON bse.id = a.sale_id
+  GROUP BY 1, 2
+)
+SELECT
+  prd_a.name AS product_a,
+  prd_b.name AS product_b,
+  cnt_orders_together
+FROM pairs prs
+JOIN products prd_a ON prd_a.id = prs.product_id_a
+JOIN products prd_b ON prd_b.id = prs.product_id_b
+ORDER BY cnt_orders_together DESC
+LIMIT 50;
+```
+
+## 15) Funil de produção/entrega por hora do dia (Delivery, 30 dias)
+```sql
+WITH base AS (
+  SELECT sls.id, sls.created_at, sls.delivery_seconds, sls.channel_id
+  FROM sales sls
+  WHERE sls.created_at >= NOW() - INTERVAL '30 days'
+    AND sls.sale_status_desc = 'COMPLETED'
+),
+by_hour AS (
+  SELECT
+    EXTRACT(HOUR FROM bse.created_at)::int AS hour_of_day,
+    COUNT(DISTINCT bse.id) AS sales_count,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY bse.delivery_seconds) AS p50_delivery_s,
+    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY bse.delivery_seconds) AS p90_delivery_s
+  FROM base bse
+  JOIN channels chn ON chn.id = bse.channel_id
+  WHERE chn.type = 'D'
+  GROUP BY 1
+)
+SELECT *
+FROM by_hour
+ORDER BY hour_of_day;
+```
+
+## 16) Comparativo YoY por mês (com calendário derivado)
+```sql
+WITH base AS (
+  SELECT sls.id, sls.created_at, sls.total_amount
+  FROM sales sls
+  WHERE sls.created_at >= DATE_TRUNC('year', NOW()) - INTERVAL '1 year'
+    AND sls.sale_status_desc = 'COMPLETED'
+),
+monthly AS (
+  SELECT
+    DATE_TRUNC('month', bse.created_at) AS month_dt,
+    SUM(bse.total_amount) AS revenue
+  FROM base bse
+  GROUP BY 1
+),
+this_year AS (
+  SELECT month_dt, revenue
+  FROM monthly
+  WHERE month_dt >= DATE_TRUNC('year', NOW())
+),
+last_year AS (
+  SELECT month_dt + INTERVAL '1 year' AS month_dt, revenue AS revenue_ly
+  FROM monthly
+  WHERE month_dt < DATE_TRUNC('year', NOW())
+)
+SELECT
+  ty.month_dt,
+  ty.revenue AS revenue_ty,
+  ly.revenue_ly,
+  ROUND(100.0 * (ty.revenue - ly.revenue_ly) / NULLIF(ly.revenue_ly, 0), 2) AS yoy_pct
+FROM this_year ty
+LEFT JOIN last_year ly USING (month_dt)
+ORDER BY ty.month_dt;
+```
